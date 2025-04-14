@@ -36,7 +36,7 @@ impl Scanner {
         progress: Arc<ScanProgress>,
         scan_type: ScanType,
     ) -> Self {
-        let rate_controller = Arc::new(RateController::new(1000, 100));
+        let rate_controller = Arc::new(RateController::new(5000, 1000));
         Self {
             target,
             start_port,
@@ -50,6 +50,9 @@ impl Scanner {
     }
 
     pub async fn run(&self) -> Result<Vec<u16>> {
+        println!("当前扫描速率: {} 请求/秒", self.rate_controller.get_current_rate());
+        println!("总请求数: {}", self.rate_controller.get_total_requests());
+        
         match self.scan_type {
             ScanType::Tcp => self.run_tcp_scan().await,
             ScanType::Udp => self.run_udp_scan().await,
@@ -61,7 +64,7 @@ impl Scanner {
         let mut open_ports = Vec::new();
         let mut tasks = Vec::new();
 
-        let batch_size = 100;
+        let batch_size = 1000;
         
         if self.end_port < self.start_port {
             return Ok(Vec::new());
@@ -96,11 +99,29 @@ impl Scanner {
                 let mut batch_ports = Vec::new();
                 let _permit = semaphore.acquire().await.unwrap();
 
+                let mut port_tasks = Vec::new();
                 for port in start..end {
-                    if let Ok(true) = Self::scan_port(target, port, timeout, &rate_controller).await {
+                    let target = target;
+                    let timeout = timeout;
+                    let rate_controller = rate_controller.clone();
+                    let progress = progress.clone();
+
+                    let port_task = tokio::spawn(async move {
+                        if let Ok(true) = Self::scan_port(target, port, timeout, &rate_controller).await {
+                            progress.increment();
+                            Some(port)
+                        } else {
+                            progress.increment();
+                            None
+                        }
+                    });
+                    port_tasks.push(port_task);
+                }
+
+                for port_task in port_tasks {
+                    if let Ok(Some(port)) = port_task.await {
                         batch_ports.push(port);
                     }
-                    progress.increment();
                 }
 
                 batch_ports

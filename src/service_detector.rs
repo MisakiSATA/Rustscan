@@ -1,11 +1,13 @@
 use std::net::{IpAddr, TcpStream};
 use std::time::Duration;
 use anyhow::Result;
+use crate::service_fingerprints::{ServiceFingerprintDB, ServiceFingerprint};
 
 pub struct ServiceDetector {
     target: IpAddr,
     port: u16,
     timeout: Duration,
+    fingerprint_db: ServiceFingerprintDB,
 }
 
 impl ServiceDetector {
@@ -14,22 +16,55 @@ impl ServiceDetector {
             target,
             port,
             timeout,
+            fingerprint_db: ServiceFingerprintDB::new(),
         }
     }
 
-    pub fn detect(&self) -> Result<String> {
+    pub async fn detect(&self) -> Result<String> {
+        // 并行执行所有检测方法
+        let fingerprint_task = self.detect_via_fingerprint();
+        let banner_task = self.detect_via_banner();
+        let port = self.port; // 复制端口号
+
+        // 等待所有任务完成，选择最可靠的结果
+        let (fingerprint_result, banner_result) = tokio::join!(
+            fingerprint_task,
+            banner_task,
+        );
+
+        // 优先使用指纹识别结果
+        if let Ok(Some(fingerprint)) = fingerprint_result {
+            if fingerprint.weight > 0.8 {
+                return Ok(format!("{} ({})", fingerprint.name, fingerprint.protocol));
+            }
+            return Ok(fingerprint.name);
+        }
+
+        // 其次使用banner识别结果
+        if let Ok(service) = banner_result {
+            if service != "Unknown" {
+                return Ok(service);
+            }
+        }
+
+        // 最后使用端口猜测结果
+        Ok(self.guess_service_by_port())
+    }
+
+    async fn detect_via_fingerprint(&self) -> Result<Option<ServiceFingerprint>> {
+        self.fingerprint_db.identify_service(
+            &self.target.to_string(),
+            self.port,
+            self.timeout
+        ).await
+    }
+
+    async fn detect_via_banner(&self) -> Result<String> {
         let socket = std::net::TcpStream::connect_timeout(
             &(self.target, self.port).into(),
             self.timeout,
         )?;
-
-        // 尝试读取banner
-        if let Ok(service) = self.read_banner(&socket) {
-            return Ok(service);
-        }
-
-        // 根据端口号猜测服务
-        Ok(self.guess_service_by_port())
+        self.read_banner(&socket)
     }
 
     fn read_banner(&self, _socket: &TcpStream) -> Result<String> {

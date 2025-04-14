@@ -135,7 +135,17 @@ impl ServiceFingerprintDB {
                         let response = String::from_utf8_lossy(&buffer[..len]);
                         
                         for fingerprint in fingerprints {
+                            // 首先检查 banner_pattern
                             if let Some(pattern) = &fingerprint.banner_pattern {
+                                if let Ok(re) = Regex::new(pattern) {
+                                    if re.is_match(&response) {
+                                        return Ok(Some(fingerprint.clone()));
+                                    }
+                                }
+                            }
+                            
+                            // 然后检查 response_pattern
+                            if let Some(pattern) = &fingerprint.response_pattern {
                                 if let Ok(re) = Regex::new(pattern) {
                                     if re.is_match(&response) {
                                         return Ok(Some(fingerprint.clone()));

@@ -111,7 +111,7 @@ async fn main() -> Result<()> {
     // 服务识别
     for port in open_ports {
         let detector = ServiceDetector::new(target_ip, port, timeout);
-        if let Ok(service) = detector.detect() {
+        if let Ok(service) = detector.detect().await {
             output.add_port(port, service, 
                 if matches!(scan_type, ScanType::Tcp) { "TCP" } else { "UDP" }.to_string()
             );

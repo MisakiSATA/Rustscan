@@ -34,6 +34,10 @@ impl ScanProgress {
     }
 
     pub fn finish(&self) {
+        println!("扫描完成: {}/{} 端口已扫描", 
+            self.get_scanned(), 
+            self.get_total()
+        );
         self.progress_bar.finish();
     }
 
