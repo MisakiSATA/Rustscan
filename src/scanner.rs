@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use crate::progress::ScanProgress;
 use crate::rate_controller::RateController;
+use std::collections::VecDeque;
 
 #[derive(Clone)]
 pub struct Scanner {
@@ -36,7 +37,10 @@ impl Scanner {
         progress: Arc<ScanProgress>,
         scan_type: ScanType,
     ) -> Self {
-        let rate_controller = Arc::new(RateController::new(5000, 1000));
+        let rate_controller = Arc::new(RateController::new(
+            threads as u64,
+            (threads / 10).max(1) as u64
+        ));
         Self {
             target,
             start_port,
@@ -51,6 +55,7 @@ impl Scanner {
 
     pub async fn run(&self) -> Result<Vec<u16>> {
         println!("当前扫描速率: {} 请求/秒", self.rate_controller.get_current_rate());
+        println!("每秒实际请求数: {} 请求/秒", self.rate_controller.get_requests_per_second());
         println!("总请求数: {}", self.rate_controller.get_total_requests());
         
         match self.scan_type {
@@ -64,30 +69,14 @@ impl Scanner {
         let mut open_ports = Vec::new();
         let mut tasks = Vec::new();
 
-        let batch_size = 1000;
-        
-        if self.end_port < self.start_port {
-            return Ok(Vec::new());
-        }
-
-        let total_ports = (self.end_port as u32).checked_sub(self.start_port as u32)
-            .and_then(|diff| diff.checked_add(1))
-            .map(|total| total as usize)
-            .unwrap_or(0);
-
-        if total_ports == 0 {
-            return Ok(Vec::new());
-        }
-
+        // 将端口范围分成多个批次
+        let total_ports = (self.end_port as u32 - self.start_port as u32 + 1) as usize;
+        let batch_size = (total_ports + self.threads - 1) / self.threads;
         let num_batches = (total_ports + batch_size - 1) / batch_size;
 
         for batch in 0..num_batches {
-            let batch_start = (batch * batch_size) as u32;
-            let start = self.start_port as u32 + batch_start;
-            let end = std::cmp::min(start + batch_size as u32, self.end_port as u32 + 1);
-            
-            let start = start.min(u16::MAX as u32) as u16;
-            let end = end.min(u16::MAX as u32) as u16;
+            let batch_start = self.start_port as u32 + (batch * batch_size) as u32;
+            let batch_end = std::cmp::min(batch_start + batch_size as u32, self.end_port as u32 + 1);
             
             let semaphore = semaphore.clone();
             let progress = self.progress.clone();
@@ -99,29 +88,17 @@ impl Scanner {
                 let mut batch_ports = Vec::new();
                 let _permit = semaphore.acquire().await.unwrap();
 
-                let mut port_tasks = Vec::new();
-                for port in start..end {
-                    let target = target;
-                    let timeout = timeout;
-                    let rate_controller = rate_controller.clone();
-                    let progress = progress.clone();
-
-                    let port_task = tokio::spawn(async move {
-                        if let Ok(true) = Self::scan_port(target, port, timeout, &rate_controller).await {
-                            progress.increment();
-                            Some(port)
-                        } else {
-                            progress.increment();
-                            None
-                        }
-                    });
-                    port_tasks.push(port_task);
+                // 使用工作窃取队列来管理端口扫描任务
+                let mut port_queue = VecDeque::new();
+                for port in batch_start..batch_end {
+                    port_queue.push_back(port as u16);
                 }
 
-                for port_task in port_tasks {
-                    if let Ok(Some(port)) = port_task.await {
+                while let Some(port) = port_queue.pop_front() {
+                    if let Ok(true) = Self::scan_port(target, port, timeout, &rate_controller).await {
                         batch_ports.push(port);
                     }
+                    progress.increment_port_scan();
                 }
 
                 batch_ports
@@ -130,6 +107,7 @@ impl Scanner {
             tasks.push(task);
         }
 
+        // 收集所有开放端口
         for task in tasks {
             if let Ok(ports) = task.await {
                 open_ports.extend(ports);
@@ -145,30 +123,14 @@ impl Scanner {
         let mut open_ports = Vec::new();
         let mut tasks = Vec::new();
 
-        let batch_size = 100;
-        
-        if self.end_port < self.start_port {
-            return Ok(Vec::new());
-        }
-
-        let total_ports = (self.end_port as u32).checked_sub(self.start_port as u32)
-            .and_then(|diff| diff.checked_add(1))
-            .map(|total| total as usize)
-            .unwrap_or(0);
-
-        if total_ports == 0 {
-            return Ok(Vec::new());
-        }
-
-        let num_batches = (total_ports + batch_size - 1) / batch_size;
+        // UDP扫描使用更小的批次大小
+        const UDP_BATCH_SIZE: usize = 100;
+        let total_ports = (self.end_port - self.start_port + 1) as usize;
+        let num_batches = (total_ports + UDP_BATCH_SIZE - 1) / UDP_BATCH_SIZE;
 
         for batch in 0..num_batches {
-            let batch_start = (batch * batch_size) as u32;
-            let start = self.start_port as u32 + batch_start;
-            let end = std::cmp::min(start + batch_size as u32, self.end_port as u32 + 1);
-            
-            let start = start.min(u16::MAX as u32) as u16;
-            let end = end.min(u16::MAX as u32) as u16;
+            let batch_start = self.start_port + (batch * UDP_BATCH_SIZE) as u16;
+            let batch_end = std::cmp::min(batch_start + UDP_BATCH_SIZE as u16, self.end_port + 1);
             
             let semaphore = semaphore.clone();
             let progress = self.progress.clone();
@@ -180,11 +142,11 @@ impl Scanner {
                 let mut batch_ports = Vec::new();
                 let _permit = semaphore.acquire().await.unwrap();
 
-                for port in start..end {
+                for port in batch_start..batch_end {
                     if let Ok(true) = Self::scan_udp_port(target, port, timeout, &rate_controller).await {
                         batch_ports.push(port);
                     }
-                    progress.increment();
+                    progress.increment_port_scan();
                 }
 
                 batch_ports
@@ -215,12 +177,12 @@ impl Scanner {
         match time::timeout(timeout, TcpStream::connect(&addr)).await {
             Ok(Ok(_)) => {
                 rate_controller.increment_requests();
-                rate_controller.adjust_rate(1.0, Duration::from_millis(0));
+                rate_controller.adjust_rate(true, Duration::from_millis(0));
                 Ok(true)
             }
             Ok(Err(_)) => {
                 rate_controller.increment_requests();
-                rate_controller.adjust_rate(0.0, Duration::from_millis(0));
+                rate_controller.adjust_rate(false, Duration::from_millis(0));
                 Ok(false)
             }
             Err(_) => Ok(false),
@@ -245,18 +207,18 @@ impl Scanner {
         match socket.recv_from(&mut buf) {
             Ok(_) => {
                 rate_controller.increment_requests();
-                rate_controller.adjust_rate(1.0, Duration::from_millis(0));
+                rate_controller.adjust_rate(true, Duration::from_millis(0));
                 Ok(true)
             }
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::WouldBlock || 
                    e.kind() == std::io::ErrorKind::TimedOut {
                     rate_controller.increment_requests();
-                    rate_controller.adjust_rate(0.5, Duration::from_millis(0));
+                    rate_controller.adjust_rate(true, Duration::from_millis(0));
                     Ok(true)
                 } else {
                     rate_controller.increment_requests();
-                    rate_controller.adjust_rate(0.0, Duration::from_millis(0));
+                    rate_controller.adjust_rate(false, Duration::from_millis(0));
                     Ok(false)
                 }
             }
