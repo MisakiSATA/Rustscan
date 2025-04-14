@@ -4,10 +4,11 @@ use tokio::net::TcpStream;
 use tokio::time;
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, Mutex};
 use crate::progress::ScanProgress;
 use crate::rate_controller::RateController;
-use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use crate::service_detector::ServiceDetector;
 
 #[derive(Clone)]
 pub struct Scanner {
@@ -17,8 +18,8 @@ pub struct Scanner {
     timeout: Duration,
     threads: usize,
     progress: Arc<ScanProgress>,
-    rate_controller: Arc<RateController>,
-    scan_type: ScanType,
+    rate_controller: Arc<Mutex<RateController>>,
+    service_detector: Arc<ServiceDetector>,
 }
 
 #[derive(Clone, Debug)]
@@ -35,12 +36,10 @@ impl Scanner {
         timeout: Duration,
         threads: usize,
         progress: Arc<ScanProgress>,
-        scan_type: ScanType,
+        rate_controller: Arc<Mutex<RateController>>,
+        _scan_type: ScanType,
+        service_detector: Arc<ServiceDetector>,
     ) -> Self {
-        let rate_controller = Arc::new(RateController::new(
-            threads as u64,
-            (threads / 10).max(1) as u64
-        ));
         Self {
             target,
             start_port,
@@ -49,68 +48,52 @@ impl Scanner {
             threads,
             progress,
             rate_controller,
-            scan_type,
+            service_detector,
         }
     }
 
-    pub async fn run(&self) -> Result<Vec<u16>> {
-        println!("当前扫描速率: {} 请求/秒", self.rate_controller.get_current_rate());
-        println!("每秒实际请求数: {} 请求/秒", self.rate_controller.get_requests_per_second());
-        println!("总请求数: {}", self.rate_controller.get_total_requests());
+    pub async fn run(&self) -> Result<()> {
+        let open_ports = self.run_tcp_scan().await?;
+        self.progress.set_total_services(open_ports.len() as u64);
         
-        match self.scan_type {
-            ScanType::Tcp => self.run_tcp_scan().await,
-            ScanType::Udp => self.run_udp_scan().await,
+        for port in open_ports {
+            if let Ok(Some(service)) = self.service_detector.detect(self.target, port).await {
+                println!("端口 {}: {}", port, service);
+                self.progress.increment_service_detect();
+            }
         }
+        
+        self.progress.finish();
+        Ok(())
     }
 
-    async fn run_tcp_scan(&self) -> Result<Vec<u16>> {
-        let semaphore = Arc::new(Semaphore::new(self.threads));
+    pub async fn run_tcp_scan(&self) -> Result<Vec<u16>> {
         let mut open_ports = Vec::new();
+        let semaphore = Arc::new(Semaphore::new(self.threads));
+        let total_requests = Arc::new(AtomicU64::new(0));
+
         let mut tasks = Vec::new();
-
-        // 将端口范围分成多个批次
-        let total_ports = (self.end_port as u32 - self.start_port as u32 + 1) as usize;
-        let batch_size = (total_ports + self.threads - 1) / self.threads;
-        let num_batches = (total_ports + batch_size - 1) / batch_size;
-
-        for batch in 0..num_batches {
-            let batch_start = self.start_port as u32 + (batch * batch_size) as u32;
-            let batch_end = std::cmp::min(batch_start + batch_size as u32, self.end_port as u32 + 1);
-            
+        
+        for port in self.start_port..=self.end_port {
+            let target = self.target;
+            let timeout = self.timeout;
             let semaphore = semaphore.clone();
             let progress = self.progress.clone();
             let rate_controller = self.rate_controller.clone();
-            let target = self.target;
-            let timeout = self.timeout;
+            let total_requests = total_requests.clone();
 
-            let task = tokio::spawn(async move {
-                let mut batch_ports = Vec::new();
+            tasks.push(tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.unwrap();
-
-                // 使用工作窃取队列来管理端口扫描任务
-                let mut port_queue = VecDeque::new();
-                for port in batch_start..batch_end {
-                    port_queue.push_back(port as u16);
-                }
-
-                while let Some(port) = port_queue.pop_front() {
-                    if let Ok(true) = Self::scan_port(target, port, timeout, &rate_controller).await {
-                        batch_ports.push(port);
-                    }
-                    progress.increment_port_scan();
-                }
-
-                batch_ports
-            });
-
-            tasks.push(task);
+                let result = Self::scan_port(target, port, timeout, rate_controller, total_requests).await;
+                progress.increment_port_scan();
+                result
+            }));
         }
 
-        // 收集所有开放端口
-        for task in tasks {
-            if let Ok(ports) = task.await {
-                open_ports.extend(ports);
+        let results = futures::future::join_all(tasks).await;
+        for result in results {
+            if let Ok(Some(port)) = result {
+                open_ports.push(port);
             }
         }
 
@@ -143,7 +126,7 @@ impl Scanner {
                 let _permit = semaphore.acquire().await.unwrap();
 
                 for port in batch_start..batch_end {
-                    if let Ok(true) = Self::scan_udp_port(target, port, timeout, &rate_controller).await {
+                    if let Ok(true) = Self::scan_udp_port(target, port, timeout, rate_controller.clone()).await {
                         batch_ports.push(port);
                     }
                     progress.increment_port_scan();
@@ -168,24 +151,30 @@ impl Scanner {
     async fn scan_port(
         target: IpAddr,
         port: u16,
-        timeout: Duration,
-        rate_controller: &RateController,
-    ) -> Result<bool> {
-        rate_controller.wait().await;
+        timeout_duration: Duration,
+        rate_controller: Arc<Mutex<RateController>>,
+        total_requests: Arc<AtomicU64>,
+    ) -> Option<u16> {
         let addr = SocketAddr::new(target, port);
         
-        match time::timeout(timeout, TcpStream::connect(&addr)).await {
+        // 在获取锁之前增加请求计数
+        total_requests.fetch_add(1, Ordering::Relaxed);
+        
+        // 使用非阻塞连接
+        match time::timeout(timeout_duration, TcpStream::connect(&addr)).await {
             Ok(Ok(_)) => {
-                rate_controller.increment_requests();
-                rate_controller.adjust_rate(true, Duration::from_millis(0));
-                Ok(true)
+                // 连接成功，调整速率
+                let mut controller = rate_controller.lock().await;
+                controller.adjust_rate(true, Duration::from_millis(0));
+                Some(port)
             }
             Ok(Err(_)) => {
-                rate_controller.increment_requests();
-                rate_controller.adjust_rate(false, Duration::from_millis(0));
-                Ok(false)
+                // 连接失败，调整速率
+                let mut controller = rate_controller.lock().await;
+                controller.adjust_rate(false, Duration::from_millis(0));
+                None
             }
-            Err(_) => Ok(false),
+            Err(_) => None,
         }
     }
 
@@ -193,8 +182,9 @@ impl Scanner {
         target: IpAddr,
         port: u16,
         timeout: Duration,
-        rate_controller: &RateController,
+        rate_controller: Arc<Mutex<RateController>>,
     ) -> Result<bool> {
+        let mut rate_controller = rate_controller.lock().await;
         rate_controller.wait().await;
         let addr = SocketAddr::new(target, port);
         
@@ -211,13 +201,12 @@ impl Scanner {
                 Ok(true)
             }
             Err(e) => {
+                rate_controller.increment_requests();
                 if e.kind() == std::io::ErrorKind::WouldBlock || 
                    e.kind() == std::io::ErrorKind::TimedOut {
-                    rate_controller.increment_requests();
                     rate_controller.adjust_rate(true, Duration::from_millis(0));
                     Ok(true)
                 } else {
-                    rate_controller.increment_requests();
                     rate_controller.adjust_rate(false, Duration::from_millis(0));
                     Ok(false)
                 }

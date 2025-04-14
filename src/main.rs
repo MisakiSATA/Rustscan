@@ -13,6 +13,7 @@ use std::time::Duration;
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use rustscan::scanner::{Scanner, ScanType};
 use rustscan::service_detector::ServiceDetector;
@@ -20,6 +21,7 @@ use rustscan::os_detector::OSDetector;
 use rustscan::output::Output;
 use rustscan::progress::ScanProgress;
 use rustscan::ping::ping;
+use rustscan::rate_controller::RateController;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -117,7 +119,7 @@ async fn main() -> Result<()> {
     );
 
     // 创建进度显示器
-    let progress = Arc::new(ScanProgress::new(total_ports * total_targets));
+    let progress = Arc::new(ScanProgress::new(total_ports * total_targets, total_targets));
 
     // 并行扫描所有目标
     let mut tasks = Vec::new();
@@ -147,11 +149,13 @@ async fn main() -> Result<()> {
                 timeout,
                 threads,
                 progress.clone(),
+                Arc::new(Mutex::new(RateController::new(threads as u64 * 1000, (threads / 10).max(1) as u64))),
                 scan_type.clone(),
+                Arc::new(ServiceDetector::new()),
             );
 
             // 执行端口扫描
-            let open_ports = scanner.run().await?;
+            let open_ports = scanner.run_tcp_scan().await?;
 
             // 创建输出对象
             let mut output = Output::new(target.to_string());
@@ -168,10 +172,10 @@ async fn main() -> Result<()> {
 
             // 服务识别
             let open_ports_clone = open_ports.clone();
-            for port in &open_ports_clone {
-                let detector = ServiceDetector::new(target, *port, timeout);
-                if let Ok(service) = detector.detect().await {
-                    output.add_port(*port, service, 
+            for port in open_ports_clone {
+                let detector = ServiceDetector::new();
+                if let Ok(Some(service)) = detector.detect(target, port).await {
+                    output.add_port(port, service, 
                         if matches!(scan_type, ScanType::Tcp) { "TCP" } else { "UDP" }.to_string()
                     );
                 }
