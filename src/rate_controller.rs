@@ -34,7 +34,7 @@ impl RateController {
     pub async fn wait(&self) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.start_time).as_secs();
-        
+
         // 每秒重置请求计数
         if elapsed > self.last_second_time.load(Ordering::Relaxed) {
             self.last_second_requests.store(0, Ordering::Relaxed);
@@ -46,21 +46,19 @@ impl RateController {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
 
         // 计算请求间隔
-        let current_rate = self.current_rate.load(Ordering::Relaxed);
+        let current_rate = self.current_rate.load(Ordering::Relaxed).max(1);
         let interval = Duration::from_secs_f64(1.0 / current_rate as f64);
-        
-        // 使用 tokio::time::sleep 替代自旋等待
+
+        // 控制速率，避免自旋
         let last_request = self.last_request_time.load(Ordering::Relaxed);
-        let current_time = now.elapsed().as_millis() as u64;
-        
-        if current_time > last_request {
-            let sleep_time = interval.as_millis() as u64 - (current_time - last_request);
-            if sleep_time > 0 {
-                time::sleep(Duration::from_millis(sleep_time)).await;
+        let now_ms = now.duration_since(self.start_time).as_millis() as u64;
+        if now_ms > last_request {
+            let next_time = last_request + interval.as_millis() as u64;
+            if next_time > now_ms {
+                time::sleep(Duration::from_millis(next_time - now_ms)).await;
             }
         }
-        
-        self.last_request_time.store(now.elapsed().as_millis() as u64, Ordering::Relaxed);
+        self.last_request_time.store(now_ms, Ordering::Relaxed);
     }
 
     pub fn increment_requests(&self) {
@@ -116,4 +114,4 @@ mod tests {
         controller.increment_requests();
         controller.wait().await;
     }
-} 
+}

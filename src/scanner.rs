@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use tokio::net::TcpSocket;
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
+use futures::stream::{FuturesUnordered, StreamExt};
 
 // 连接池结构
 struct ConnectionPool {
@@ -106,45 +107,51 @@ impl Scanner {
         }
     }
 
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(&self) -> Result<Vec<(u16, String)>> {
         let open_ports = self.run_tcp_scan().await?;
         self.progress.set_total_services(open_ports.len() as u64);
-        
-        // 批量处理服务识别
-        let batch_size = 10; // 每批处理10个端口
-        let mut tasks = Vec::new();
-        
-        for chunk in open_ports.chunks(batch_size) {
-            let ports = chunk.to_vec(); // 创建一个新的所有权
+
+        // 批量并发服务识别
+        let batch_size = 20;
+        let mut port_chunks = open_ports.chunks(batch_size);
+        let mut tasks = FuturesUnordered::new();
+
+        while let Some(chunk) = port_chunks.next() {
+            let ports = chunk.to_vec();
             let target = self.target;
             let service_detector = self.service_detector.clone();
             let progress = self.progress.clone();
-            
-            let task = tokio::spawn(async move {
-                let mut results = Vec::new();
+
+            tasks.push(tokio::spawn(async move {
+                let mut results = Vec::with_capacity(ports.len());
+                let mut futs = FuturesUnordered::new();
                 for &port in &ports {
-                    if let Ok(Some(service)) = service_detector.detect(target, port).await {
+                    let service_detector = service_detector.clone();
+                    futs.push(async move {
+                        let res = service_detector.detect(target, port).await;
+                        (port, res)
+                    });
+                }
+                while let Some((port, res)) = futs.next().await {
+                    if let Ok(Some(service)) = res {
                         results.push((port, service));
                     }
                     progress.increment_service_detect();
                 }
                 results
-            });
-            
-            tasks.push(task);
+            }));
         }
 
-        let results = futures::future::join_all(tasks).await;
-        for result in results {
+        let mut all_results = Vec::new();
+        while let Some(result) = tasks.next().await {
             if let Ok(services) = result {
                 for (port, service) in services {
-                    println!("端口 {}: {}", port, service);
+                    all_results.push((port, service));
                 }
             }
         }
-        
-        self.progress.finish();
-        Ok(())
+
+        Ok(all_results)
     }
 
     pub async fn run_tcp_scan(&self) -> Result<Vec<u16>> {
@@ -152,20 +159,19 @@ impl Scanner {
         let total_requests = Arc::new(AtomicU64::new(0));
         let open_ports_mutex = Arc::new(Mutex::new(Vec::<u16>::new()));
 
-        // 计算批处理数量，使用安全的数学运算
         let total_ports = (self.end_port as u32).saturating_sub(self.start_port as u32).saturating_add(1) as usize;
-        let batch_size = 1000; // 增加批处理大小以提高性能
+        let batch_size = 2000; // 更大批次提升效率
         let num_batches = (total_ports + batch_size - 1) / batch_size;
-        
-        let mut tasks = Vec::with_capacity(num_batches);
-        
+
+        let mut tasks = FuturesUnordered::new();
+
         for batch in 0..num_batches {
             let batch_start = self.start_port.saturating_add((batch * batch_size) as u16);
             let batch_end = std::cmp::min(
                 batch_start.saturating_add(batch_size as u16),
                 self.end_port.saturating_add(1)
             );
-            
+
             let target = self.target;
             let timeout = self.timeout;
             let semaphore = semaphore.clone();
@@ -174,42 +180,34 @@ impl Scanner {
             let total_requests = total_requests.clone();
             let open_ports = open_ports_mutex.clone();
 
-            let task = tokio::spawn(async move {
+            tasks.push(tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.unwrap();
-                let mut batch_ports = Vec::new();
+                let mut batch_ports = Vec::with_capacity((batch_end - batch_start) as usize);
 
-                let mut futures = Vec::new();
+                let mut futs = FuturesUnordered::new();
                 for port in batch_start..batch_end {
                     let target = target;
                     let timeout = timeout;
                     let rate_controller = rate_controller.clone();
                     let total_requests = total_requests.clone();
-                    
-                    futures.push(Self::scan_port(
-                        target,
-                        port,
-                        timeout,
-                        rate_controller,
-                        total_requests,
-                    ));
+                    futs.push(Self::scan_port(target, port, timeout, rate_controller, total_requests));
                 }
-
-                let results = futures::future::join_all(futures).await;
-                for (i, result) in results.into_iter().enumerate() {
+                let mut idx = 0;
+                while let Some(result) = futs.next().await {
                     if result.is_some() {
-                        batch_ports.push(batch_start.saturating_add(i as u16));
+                        batch_ports.push(batch_start.saturating_add(idx as u16));
                     }
                     progress.increment_port_scan();
+                    idx += 1;
                 }
 
                 let mut open_ports = open_ports.lock().await;
                 open_ports.extend(batch_ports);
-            });
-
-            tasks.push(task);
+            }));
         }
 
-        futures::future::join_all(tasks).await;
+        while let Some(_res) = tasks.next().await {}
+
         let open_ports = open_ports_mutex.lock().await;
         let mut result = open_ports.clone();
         result.sort();

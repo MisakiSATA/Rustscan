@@ -31,15 +31,10 @@ impl OSDetector {
 
     pub async fn detect(&self) -> Result<OSInfo> {
         // 并行执行所有检测方法
-        let http_task = self.detect_via_http();
-        let tcp_task = self.detect_via_tcp();
-        let services_task = self.detect_via_services();
-
-        // 等待所有任务完成
         let (http_result, tcp_result, services_result) = tokio::join!(
-            http_task,
-            tcp_task,
-            services_task
+            self.detect_via_http(),
+            self.detect_via_tcp(),
+            self.detect_via_services()
         );
 
         // 合并结果
@@ -48,31 +43,17 @@ impl OSDetector {
         let mut best_name = "Unknown".to_string();
         let mut best_version = None;
 
-        if let Ok(info) = http_result {
+        for info in [http_result, tcp_result, services_result].iter().filter_map(|r| r.as_ref().ok()) {
             if info.confidence > max_confidence {
                 max_confidence = info.confidence;
-                best_name = info.name;
-                best_version = info.version;
+                best_name = info.name.clone();
+                best_version = info.version.clone();
             }
-            all_features.extend(info.features);
-        }
-
-        if let Ok(info) = tcp_result {
-            if info.confidence > max_confidence {
-                max_confidence = info.confidence;
-                best_name = info.name;
-                best_version = info.version;
+            for feat in &info.features {
+                if !all_features.contains(feat) {
+                    all_features.push(feat.clone());
+                }
             }
-            all_features.extend(info.features);
-        }
-
-        if let Ok(info) = services_result {
-            if info.confidence > max_confidence {
-                max_confidence = info.confidence;
-                best_name = info.name;
-                best_version = info.version;
-            }
-            all_features.extend(info.features);
         }
 
         Ok(OSInfo {
@@ -303,4 +284,4 @@ mod tests {
         let result = detector.detect().await;
         assert!(result.is_ok());
     }
-} 
+}

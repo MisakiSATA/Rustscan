@@ -134,14 +134,12 @@ async fn main() -> Result<()> {
         let csv_output = args.csv_output.clone();
 
         let task = tokio::spawn(async move {
-            // 如果启用了ping扫描，先检查主机是否存活
             if ping_only {
                 if !ping(target, timeout).await {
-                    return Ok::<Vec<u16>, anyhow::Error>(Vec::new());
+                    return Ok::<(Vec<(u16, String)>, Output), anyhow::Error>((Vec::new(), Output::new(target.to_string())));
                 }
             }
 
-            // 创建扫描器
             let scanner = Scanner::new(
                 target,
                 start_port,
@@ -154,58 +152,59 @@ async fn main() -> Result<()> {
                 Arc::new(ServiceDetector::new()),
             );
 
-            // 执行端口扫描
-            let open_ports = scanner.run_tcp_scan().await?;
-
-            // 创建输出对象
-            let mut output = Output::new(target.to_string());
-
-            // 设置服务识别进度条
-            progress.set_total_services(open_ports.len() as u64);
+            // 只返回服务识别结果
+            let service_results = scanner.run().await?;
 
             // 操作系统识别
+            let mut output = Output::new(target.to_string());
             let os_detector = OSDetector::new(target);
             if let Ok(os_info) = os_detector.detect().await {
                 output.set_os_info(os_info);
                 progress.set_os_detected();
             }
 
-            // 服务识别
-            let open_ports_clone = open_ports.clone();
-            for port in open_ports_clone {
-                let detector = ServiceDetector::new();
-                if let Ok(Some(service)) = detector.detect(target, port).await {
-                    output.add_port(port, service, 
-                        if matches!(scan_type, ScanType::Tcp) { "TCP" } else { "UDP" }.to_string()
-                    );
-                }
-                progress.increment_service_detect();
+            // 填充端口和服务
+            for (port, service) in &service_results {
+                output.add_port(*port, service.clone(),
+                    if matches!(scan_type, ScanType::Tcp) { "TCP" } else { "UDP" }.to_string()
+                );
             }
-
-            // 输出结果
-            output.print_console();
 
             // 保存结果
             if let Some(path) = &json_output {
                 output.save_json(path)?;
-                println!("{} 结果已保存到: {:?}", "[*]".blue(), path);
             }
-
             if let Some(path) = &csv_output {
                 output.save_csv(path)?;
-                println!("{} 结果已保存到: {:?}", "[*]".blue(), path);
             }
 
-            Ok(open_ports)
+            Ok((service_results, output))
         });
 
         tasks.push(task);
     }
 
-    // 等待所有扫描任务完成
+    // 等待所有扫描任务完成，统一 finish 进度条和输出
     for task in tasks {
-        if let Err(e) = task.await? {
-            eprintln!("扫描出错: {}", e);
+        match task.await? {
+            Ok((service_results, output)) => {
+                progress.finish();
+                // 先输出服务识别结果
+                if !service_results.is_empty() {
+                    println!("\n开放端口与服务：");
+                    for (port, service) in service_results {
+                        println!("  - 端口 {}: {}", port, service);
+                    }
+                } else {
+                    println!("\n未发现开放端口。");
+                }
+                // 再输出统计信息
+                output.print_console();
+            }
+            Err(e) => {
+                progress.finish();
+                eprintln!("扫描出错: {}", e);
+            }
         }
     }
 

@@ -1,7 +1,7 @@
-use std::path::PathBuf;
-use serde::{Serialize, Deserialize};
-use colored::*;
 use crate::os_detector::OSInfo;
+use colored::*;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Output {
@@ -41,10 +41,11 @@ impl Output {
     pub fn print_console(&self) {
         println!("{} 扫描结果:", "[*]".blue());
         println!("目标: {}", self.target);
-        
+
         if let Some(os_info) = &self.os_info {
-            println!("操作系统: {} (置信度: {:.2}%)", 
-                os_info.name, 
+            println!(
+                "操作系统: {} (置信度: {:.2}%)",
+                os_info.name,
                 os_info.confidence * 100.0
             );
             if let Some(version) = &os_info.version {
@@ -58,10 +59,9 @@ impl Output {
 
         println!("\n开放端口:");
         for port_info in &self.ports {
-            println!("  - {} ({}) - {}", 
-                port_info.port, 
-                port_info.protocol, 
-                port_info.service
+            println!(
+                "  - {} ({}) - {}",
+                port_info.port, port_info.protocol, port_info.service
             );
         }
     }
@@ -74,7 +74,7 @@ impl Output {
 
     pub fn save_csv(&self, path: &PathBuf) -> anyhow::Result<()> {
         let mut wtr = csv::Writer::from_path(path)?;
-        
+
         // 写入操作系统信息
         if let Some(os_info) = &self.os_info {
             wtr.write_record(&[
@@ -98,4 +98,4 @@ impl Output {
         wtr.flush()?;
         Ok(())
     }
-} 
+}

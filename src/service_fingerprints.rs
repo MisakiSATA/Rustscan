@@ -49,6 +49,26 @@ impl ServiceFingerprintDB {
             db.initialize_default_fingerprints();
         }
         
+        // 预编译所有正则表达式
+        for fps in db.fingerprints.values() {
+            for fp in fps {
+                if let Some(pattern) = &fp.banner_pattern {
+                    if !db.compiled_patterns.contains_key(pattern) {
+                        if let Ok(re) = Regex::new(pattern) {
+                            db.compiled_patterns.insert(pattern.clone(), re);
+                        }
+                    }
+                }
+                if let Some(pattern) = &fp.response_pattern {
+                    if !db.compiled_patterns.contains_key(pattern) {
+                        if let Ok(re) = Regex::new(pattern) {
+                            db.compiled_patterns.insert(pattern.clone(), re);
+                        }
+                    }
+                }
+            }
+        }
+        
         db
     }
 
@@ -185,4 +205,4 @@ mod tests {
         let result = db.identify_service("127.0.0.1", 80, Duration::from_secs(1)).await;
         assert!(result.is_ok());
     }
-} 
+}

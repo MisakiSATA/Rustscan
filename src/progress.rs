@@ -1,9 +1,9 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use colored::*;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashSet;
 use std::net::IpAddr;
-use colored::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 pub struct ScanProgress {
     multi_progress: MultiProgress,
@@ -24,11 +24,13 @@ pub struct ScanProgress {
 impl ScanProgress {
     pub fn new(total_ports: u64, total_ips: u64) -> Self {
         let multi_progress = MultiProgress::new();
-        
+
         let port_scan_bar = multi_progress.add(ProgressBar::new(total_ports));
         port_scan_bar.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.green} 端口扫描 [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+                .template(
+                    "{spinner:.green} 端口扫描 [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}",
+                )
                 .unwrap()
                 .progress_chars("█▉▊▋▌▍▎▏  "),
         );
@@ -36,7 +38,9 @@ impl ScanProgress {
         let service_detect_bar = multi_progress.add(ProgressBar::new(0));
         service_detect_bar.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.yellow} 服务识别 [{bar:40.yellow/blue}] {pos}/{len} ({eta}) {msg}")
+                .template(
+                    "{spinner:.yellow} 服务识别 [{bar:40.yellow/blue}] {pos}/{len} ({eta}) {msg}",
+                )
                 .unwrap()
                 .progress_chars("█▉▊▋▌▍▎▏  "),
         );
@@ -75,10 +79,9 @@ impl ScanProgress {
     }
 
     pub fn increment_port_scan(&self) {
-        let scanned = self.scanned_ports.fetch_add(1, Ordering::Relaxed);
+        let scanned = self.scanned_ports.fetch_add(1, Ordering::Relaxed) + 1;
         self.port_scan_bar.inc(1);
-        
-        if scanned + 1 == self.total_ports {
+        if scanned == self.total_ports {
             self.port_scan_bar.finish_with_message("完成");
         }
     }
@@ -93,7 +96,7 @@ impl ScanProgress {
     pub fn increment_ip_scan(&self) {
         let scanned = self.scanned_ips.fetch_add(1, Ordering::Relaxed);
         self.ip_scan_bar.inc(1);
-        
+
         if scanned + 1 == self.total_ips {
             self.ip_scan_bar.finish_with_message("完成");
         }
@@ -105,10 +108,10 @@ impl ScanProgress {
     }
 
     pub fn increment_service_detect(&self) {
-        let detected = self.detected_services.fetch_add(1, Ordering::Relaxed);
+        let detected = self.detected_services.fetch_add(1, Ordering::Relaxed) + 1;
         self.service_detect_bar.inc(1);
-        
-        if detected + 1 == self.total_services.load(Ordering::Relaxed) {
+
+        if detected == self.total_services.load(Ordering::Relaxed) {
             self.service_detect_bar.finish_with_message("完成");
         }
     }
@@ -120,30 +123,7 @@ impl ScanProgress {
     }
 
     pub fn finish(&self) {
-        self.multi_progress.clear().unwrap();
-        println!("\n{}", "扫描完成:".bold().green());
-        println!("{} 已扫描端口: {}/{}", 
-            "✓".green(),
-            self.scanned_ports.load(Ordering::Relaxed),
-            self.total_ports
-        );
-        println!("{} 已识别服务: {}/{}", 
-            "✓".green(),
-            self.detected_services.load(Ordering::Relaxed),
-            self.total_services.load(Ordering::Relaxed)
-        );
-        println!("{} 操作系统识别: {}/1", 
-            "✓".green(),
-            self.os_detected.load(Ordering::Relaxed)
-        );
-        
-        let alive_ips = self.alive_ips.lock().unwrap();
-        if !alive_ips.is_empty() {
-            println!("\n{} 存活IP列表:", "存活主机:".bold().green());
-            for ip in alive_ips.iter() {
-                println!("  {} {}", "•".green(), ip);
-            }
-        }
+        let _ = self.multi_progress.clear();
     }
 }
 
@@ -157,4 +137,4 @@ mod tests {
         assert_eq!(progress.total_ports, 100);
         assert_eq!(progress.scanned_ports.load(Ordering::Relaxed), 0);
     }
-} 
+}
