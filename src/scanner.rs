@@ -9,6 +9,62 @@ use crate::progress::ScanProgress;
 use crate::rate_controller::RateController;
 use std::sync::atomic::{AtomicU64, Ordering};
 use crate::service_detector::ServiceDetector;
+use std::collections::HashMap;
+use tokio::net::TcpSocket;
+use std::time::Instant;
+use tokio::io::AsyncWriteExt;
+
+// 连接池结构
+struct ConnectionPool {
+    connections: HashMap<u16, TcpStream>,
+    last_used: HashMap<u16, Instant>,
+    max_idle_time: Duration,
+}
+
+impl ConnectionPool {
+    fn new(max_idle_time: Duration) -> Self {
+        Self {
+            connections: HashMap::new(),
+            last_used: HashMap::new(),
+            max_idle_time,
+        }
+    }
+
+    async fn get_connection(&mut self, addr: SocketAddr) -> Result<Option<TcpStream>> {
+        let port = addr.port();
+        
+        // 清理过期连接
+        self.cleanup_expired();
+        
+        // 检查是否有可用的连接
+        if let Some(stream) = self.connections.remove(&port) {
+            self.last_used.remove(&port);
+            return Ok(Some(stream));
+        }
+        
+        Ok(None)
+    }
+
+    fn cleanup_expired(&mut self) {
+        let now = Instant::now();
+        let expired_ports: Vec<u16> = self.last_used
+            .iter()
+            .filter(|(_, &last_used)| now.duration_since(last_used) > self.max_idle_time)
+            .map(|(&port, _)| port)
+            .collect();
+            
+        for port in expired_ports {
+            self.connections.remove(&port);
+            self.last_used.remove(&port);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ScanType {
+    Tcp,
+    Udp,
+}
 
 #[derive(Clone)]
 pub struct Scanner {
@@ -20,12 +76,8 @@ pub struct Scanner {
     progress: Arc<ScanProgress>,
     rate_controller: Arc<Mutex<RateController>>,
     service_detector: Arc<ServiceDetector>,
-}
-
-#[derive(Clone, Debug)]
-pub enum ScanType {
-    Tcp,
-    Udp,
+    connection_pool: Arc<Mutex<ConnectionPool>>,
+    batch_size: usize,
 }
 
 impl Scanner {
@@ -49,6 +101,8 @@ impl Scanner {
             progress,
             rate_controller,
             service_detector,
+            connection_pool: Arc::new(Mutex::new(ConnectionPool::new(Duration::from_secs(30)))),
+            batch_size: 100, // 默认批处理大小
         }
     }
 
@@ -56,10 +110,36 @@ impl Scanner {
         let open_ports = self.run_tcp_scan().await?;
         self.progress.set_total_services(open_ports.len() as u64);
         
-        for port in open_ports {
-            if let Ok(Some(service)) = self.service_detector.detect(self.target, port).await {
-                println!("端口 {}: {}", port, service);
-                self.progress.increment_service_detect();
+        // 批量处理服务识别
+        let batch_size = 10; // 每批处理10个端口
+        let mut tasks = Vec::new();
+        
+        for chunk in open_ports.chunks(batch_size) {
+            let ports = chunk.to_vec(); // 创建一个新的所有权
+            let target = self.target;
+            let service_detector = self.service_detector.clone();
+            let progress = self.progress.clone();
+            
+            let task = tokio::spawn(async move {
+                let mut results = Vec::new();
+                for &port in &ports {
+                    if let Ok(Some(service)) = service_detector.detect(target, port).await {
+                        results.push((port, service));
+                    }
+                    progress.increment_service_detect();
+                }
+                results
+            });
+            
+            tasks.push(task);
+        }
+
+        let results = futures::future::join_all(tasks).await;
+        for result in results {
+            if let Ok(services) = result {
+                for (port, service) in services {
+                    println!("端口 {}: {}", port, service);
+                }
             }
         }
         
@@ -68,37 +148,72 @@ impl Scanner {
     }
 
     pub async fn run_tcp_scan(&self) -> Result<Vec<u16>> {
-        let mut open_ports = Vec::new();
         let semaphore = Arc::new(Semaphore::new(self.threads));
         let total_requests = Arc::new(AtomicU64::new(0));
+        let open_ports_mutex = Arc::new(Mutex::new(Vec::<u16>::new()));
 
-        let mut tasks = Vec::new();
+        // 计算批处理数量，使用安全的数学运算
+        let total_ports = (self.end_port as u32).saturating_sub(self.start_port as u32).saturating_add(1) as usize;
+        let batch_size = 1000; // 增加批处理大小以提高性能
+        let num_batches = (total_ports + batch_size - 1) / batch_size;
         
-        for port in self.start_port..=self.end_port {
+        let mut tasks = Vec::with_capacity(num_batches);
+        
+        for batch in 0..num_batches {
+            let batch_start = self.start_port.saturating_add((batch * batch_size) as u16);
+            let batch_end = std::cmp::min(
+                batch_start.saturating_add(batch_size as u16),
+                self.end_port.saturating_add(1)
+            );
+            
             let target = self.target;
             let timeout = self.timeout;
             let semaphore = semaphore.clone();
             let progress = self.progress.clone();
             let rate_controller = self.rate_controller.clone();
             let total_requests = total_requests.clone();
+            let open_ports = open_ports_mutex.clone();
 
-            tasks.push(tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.unwrap();
-                let result = Self::scan_port(target, port, timeout, rate_controller, total_requests).await;
-                progress.increment_port_scan();
-                result
-            }));
+                let mut batch_ports = Vec::new();
+
+                let mut futures = Vec::new();
+                for port in batch_start..batch_end {
+                    let target = target;
+                    let timeout = timeout;
+                    let rate_controller = rate_controller.clone();
+                    let total_requests = total_requests.clone();
+                    
+                    futures.push(Self::scan_port(
+                        target,
+                        port,
+                        timeout,
+                        rate_controller,
+                        total_requests,
+                    ));
+                }
+
+                let results = futures::future::join_all(futures).await;
+                for (i, result) in results.into_iter().enumerate() {
+                    if result.is_some() {
+                        batch_ports.push(batch_start.saturating_add(i as u16));
+                    }
+                    progress.increment_port_scan();
+                }
+
+                let mut open_ports = open_ports.lock().await;
+                open_ports.extend(batch_ports);
+            });
+
+            tasks.push(task);
         }
 
-        let results = futures::future::join_all(tasks).await;
-        for result in results {
-            if let Ok(Some(port)) = result {
-                open_ports.push(port);
-            }
-        }
-
-        open_ports.sort();
-        Ok(open_ports)
+        futures::future::join_all(tasks).await;
+        let open_ports = open_ports_mutex.lock().await;
+        let mut result = open_ports.clone();
+        result.sort();
+        Ok(result)
     }
 
     async fn run_udp_scan(&self) -> Result<Vec<u16>> {
@@ -160,9 +275,8 @@ impl Scanner {
         // 在获取锁之前增加请求计数
         total_requests.fetch_add(1, Ordering::Relaxed);
         
-        // 使用非阻塞连接
         match time::timeout(timeout_duration, TcpStream::connect(&addr)).await {
-            Ok(Ok(_)) => {
+            Ok(Ok(_stream)) => {
                 // 连接成功，调整速率
                 let mut controller = rate_controller.lock().await;
                 controller.adjust_rate(true, Duration::from_millis(0));

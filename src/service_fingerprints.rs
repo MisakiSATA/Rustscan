@@ -28,6 +28,7 @@ pub struct FingerprintConfig {
     pub fingerprints: Vec<ServiceFingerprint>,
 }
 
+#[derive(Clone)]
 pub struct ServiceFingerprintDB {
     fingerprints: HashMap<u16, Vec<ServiceFingerprint>>,
     compiled_patterns: HashMap<String, Regex>,
